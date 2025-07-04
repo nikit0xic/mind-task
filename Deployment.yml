@@ -1,0 +1,101 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mind-dpl
+  labels:
+    app: mind-app
+spec:
+  replicas: 1 # нижняя граница, потому что KEDA увеличит до 4 в рабочее время а в ночное будет 1
+  selector:
+    matchLabels:
+      app: mind-app
+  template:
+    metadata:
+      labels:
+        app: mind-app
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100 # Повысил по максимуму вероятность
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: mind-app
+                topologyKey: topology.kubernetes.io/zone
+      topologySpreadConstraints:
+        - maxSkew: 1 # Степень "неравномерности"
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: mind-app
+
+      containers:
+      - name: mind-app-container
+        image: registry/mind-app:v1.2.3
+        resources:
+          requests:
+            cpu: "100m"  # 0.1 cpu для HPA или KEDA
+            memory: "128Mi" # cтабильный объем памяти ~128Mi
+          limits:
+            cpu: "200m"  # задаем ресурсов не больше чем
+            memory: "256Mi" # больше на критические случаи
+        ports:
+          - containerPort: 8080
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15  # ждем пока оживет приложение
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 20 # после старта не сразу открываем трафик, чтобы учесть первый всплеск CPU
+          periodSeconds: 5
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mind-app-pdb
+spec:
+  minAvailable: 3  # небольше 1 пода из 4 будет недоступно одновременно
+  selector:
+    matchLabels:
+      app: mind-app
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: mind-app-scaledobject
+spec:
+  scaleTargetRef:
+    name: mind-dpl
+  minReplicaCount: 0  # масштабируем вниз до 1, когда нагрузка спадает
+  cooldownPeriod: 300  # время для плавного сокращением числа реплик после пика
+  triggers:
+    - type: cron
+      metadata:
+        timezone: Europe/Moscow        # Подозреваю что клиенты в основном по этому времени
+        start: "0 9 * * *"             # начало дневного триггера в 9:00 каждый день
+        end:   "0 21 * * *"            # конец триггера в 21:00 каждый день
+        desiredReplicas: "4"           # потолок для пиковой нагрузки на это время
+
+---
+apiVersion: v1 # Здесь все стандартно
+kind: Service
+metadata:
+  name: mind-svc
+spec:
+  selector:
+    app: mind-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
